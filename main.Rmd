@@ -1,0 +1,687 @@
+---
+title: "Swiss Films"
+author: "@angelozehr"
+date: "July 2019"
+---
+
+# 2019-07-reading-pdfs-in-r
+
+Read more about this project in this blogpost:
+<https://blog.az.sg/posts/reading-pdfs-in-r>
+
+
+```{r, echo = FALSE}
+package_date <- "2019-03-01" # date of the CRAN snapshot that
+R_version <- "3.5.3" # R-Version to use
+options(Ncpus = 4) # use 4 cores for parallelized installation of packages
+if (R_version != paste0(version$major, ".", version$minor)){
+  stop("ERROR: specified R version does not match currently used.")
+}
+```
+
+This repo is a simplified version of [rddj-template](https://github.com/grssnbchr/rddj-template) by Timo Grossenbacher.
+
+This report was generated on `r Sys.time()`. R version: `r paste0(version$major, ".", version$minor)` on `r version$platform`. For this report, CRAN packages as of `r package_date` were used.
+
+
+### Original data source
+
+The PDFs in the input folder belong to [Filmdistribution Schweiz](http://filmdistribution.ch/).
+
+## Preparations
+
+```{r, echo = FALSE}
+detach_all_packages <- function() {
+  basic_packages_blank <-  c("stats",
+                             "graphics",
+                             "grDevices",
+                             "utils",
+                             "datasets",
+                             "methods",
+                             "base")
+  basic_packages <- paste("package:", basic_packages_blank, sep = "")
+
+  package_list <- search()[
+    ifelse(unlist(gregexpr("package:", search())) == 1, TRUE, FALSE)]
+
+  package_list <- setdiff(package_list, basic_packages)
+
+  if (length(package_list) > 0)  for (package in package_list) {
+    detach(package, character.only = TRUE, unload = TRUE)
+    print(paste("package ", package, " detached", sep = ""))
+  }
+}
+
+detach_all_packages()
+
+# this allows multiple persons to use the same RMarkdown
+# without adjusting the working directory by themselves all the time
+source("scripts/csf.R")
+path_to_wd <- csf() # if this - for some reason - does not work,
+# replace with a hardcoded path, like so: "~/projects/rddj-template/analysis/"
+if ( is.null(path_to_wd) | !dir.exists(path_to_wd)) {
+  print("WARNING: No working directory specified for current user")
+} else {
+  setwd(path_to_wd)
+}
+
+# suppress scientific notation
+options(scipen = 999)
+
+# unload global rstudioapi and knitr again to avoid conflicts with checkpoint
+# this is only necessary if executed within RStudio
+# outside of RStudio, namely in the knit.sh script, this causes RMarkdown
+# rendering to fail, thus should not be executed there
+if (Sys.getenv("RSTUDIO") == "1"){
+  detach_all_packages()
+}
+```
+
+
+### Packages definieren
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# from https://mran.revolutionanalytics.com/web/packages/checkpoint/vignettes/using-checkpoint-with-knitr.html
+# if you don't need a package, remove it from here (commenting is probably not sufficient)
+# tidyverse: see https://blog.rstudio.org/2016/09/15/tidyverse-1-0-0/
+cat("
+library(rstudioapi)
+library(tidyverse) # ggplot2, dplyr, tidyr, readr, purrr, tibble
+library(glue) # get the tidyverse glue command without namespacing
+library(magrittr) # pipes
+library(curl) # for downloading pdfs
+library(tabulizer) # extract data from pdfs via tabula (requires JAVA)
+library(pdftools) # read pdf text without JAVA!
+library(tesseract) # OCR for reading non-standard pdfs
+library(scales) # scales for ggplot2
+library(jsonlite) # json
+library(lintr) # code linting
+library(sf) # spatial data handling
+library(rmarkdown)
+library(fuzzyjoin)",
+file = "manifest.R")
+```
+
+If you encounter problems installing tabulizer (maybe you get an error message like `rJava.so Reason: image not found`), check if you have java installed on your computer by typing `java -version` in your terminal. If nothing gets returned, install Java by following [these instructions](https://blog.az.sg/posts/reading-pdfs-in-r) (at least if you have Mac OS).
+
+
+### Packages installieren
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# if checkpoint is not yet installed, install it (for people using this
+# system for the first time)
+if (!require(checkpoint)) {
+  if (!require(devtools)) {
+    install.packages("devtools", repos = "http://cran.us.r-project.org")
+    require(devtools)
+  }
+  devtools::install_github("RevolutionAnalytics/checkpoint",
+                           ref = "v0.3.2", # could be adapted later,
+                           # as of now (beginning of July 2017
+                           # this is the current release on CRAN)
+                           repos = "http://cran.us.r-project.org")
+  require(checkpoint)
+}
+# nolint start
+if (!dir.exists("~/.checkpoint")) {
+  dir.create("~/.checkpoint")
+}
+# nolint end
+# install packages for the specified CRAN snapshot date
+checkpoint(snapshotDate = package_date,
+           project = path_to_wd,
+           verbose = T,
+           scanForPackages = T,
+           use.knitr = F,
+           R.version = R_version)
+rm(package_date)
+```
+
+
+### Packages laden
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+source("manifest.R")
+unlink("manifest.R")
+sessionInfo()
+# clean up
+rm(path_to_wd, project_name, R_version, user_name, csf, detach_all_packages)
+```
+
+
+## Read Tables
+
+By manually inspecting the files we recognise that the pdfs changed in format once during the time. Namely between week 44 and 45 in year 2010. The content itself did not change, but the column specifications did.
+
+```{r define format_changed}
+
+# define date that differenciates formats in before and after
+format_changed <- as.Date("2010-11-01")
+
+pdf_files_to_read <- list.files("input/pdf")
+
+```
+
+
+```{r first try with tabulizer}
+
+extracted_data <- pdf_files_to_read %>%
+  map_df(function(current_filename) {
+    current_path <- glue("input/pdf/{current_filename}")
+
+    date_search <- "\\d{2}.\\d{2}.\\d{4}.*\\d{2}.\\d{2}.\\d{4}"
+    numbers_search <- "[\\d']+\\s+[\\d']+\\s+[\\d']+$"
+    region_search <- "(Deutschschweiz|Suisse Romande|Svizzera Italiana)"
+
+    # try to extract all data into it's own columns
+    # by try-catching the error and running the browser
+    # we try to find out which files cause an error
+    tryCatch({
+      # read pdf file as text
+      file_content <- extract_text(current_path)
+
+      # if not successfull, return an error entry
+      if (file_content == "\n") {
+        error_entry <- tibble(
+          filename = current_filename,
+          error = "File was empty"
+        )
+        return(error_entry)
+      }
+
+      result <- file_content %>%
+        str_split("\n") %>%
+        as_tibble(.name_repair = make.names) %>%
+        mutate(
+          dates = str_extract(X, date_search),
+          # remove all that is not a number, a dash or a dot
+          dates = str_replace_all(dates, "[^\\s\\d\\.]", ""),
+          numbers = str_extract(X, numbers_search),
+          region = str_extract(X, region_search),
+          # remove numbers from source
+          X = str_replace(X, numbers_search, ""),
+          # remove thousand separator from numbers
+          numbers = str_replace_all(numbers, "'", "")
+        ) %>%
+        # fill up region downwards
+        fill(region, dates)
+
+      result %<>%
+        # separate dates into from and to
+        separate(
+          dates,
+          sep = "\\s+",
+          into = c("from", "to")
+        ) %>%
+        # convert columns from and to to Dates
+        mutate_at(vars(from, to), as.Date, format = "%d.%m.%Y") %>%
+        # filter out unused lines
+        filter(!is.na(numbers))
+
+      # somehow in separate we cannot work with column names (from)
+      # so we need to cancel the pipe here and start a new one
+      current_from <- result %>% pull(from) %>% min(na.rm = TRUE)
+      current_into <- ifelse(
+        current_from < format_changed,
+        # what's even more annoying: we cannot save a simple character vector
+        # e.g. c("adm", "scr", "tot") here, only the first value would be stored
+        "admissions,screens,total",
+        "screens,admissions,total"
+      )
+
+      result %<>%
+        # separate numbers into the three values
+        separate(
+          numbers,
+          sep = "\\s+",
+          # the order of the columns is not the same in the old and new columns
+          into = str_split(current_into, pattern = ",")[[1]]
+        )
+
+      # weird enough, in the old format, the rank is appended to the admissions
+      if (current_from < format_changed) {
+        result %<>% mutate(
+          rank = str_extract(admissions, "([1-9]|10)$"),
+          # remove it from the source
+          admissions = str_replace(admissions, "([1-9]|10)$", "")
+        )
+      } else {
+        # in the new format, its prepended to the first column
+        result %<>% mutate(
+          rank = str_extract(X, "^\\d+ "),
+          # remove it from the source
+          X = str_replace(X, "^\\d+ ", "")
+        )
+      }
+
+      # return
+      result %>%
+        rename(movie_and_distributor = X) %>%
+        # convert numbers to numeric
+        mutate_at(vars(screens, admissions, total, rank), as.numeric) %>%
+        # add column for source
+        mutate(filename = current_filename)
+
+      },
+      error = function(cond) {
+        browser()
+      }
+    )
+
+  })
+
+```
+
+After I tried the `tabulizer` approach I had to realize that it works, but not or all pdfs. Plus we were not able to keep the movie name and the distributor apart. I switched to PDFTools instead.
+
+
+### PDFTools
+
+The result of `pdf_data` looks not very helpful:
+
+```{r}
+knitr::kable(
+  pdf_data("input/pdf/top10adm-30_10.pdf")[[1]] %>%
+    top_n(10)
+)
+```
+
+Whereas the result of `pdf_text` is a text file where all the position of a text gets re-drawn as plain text with white spaces. When we inspect a file we see that the numbers of each column align perfectly:
+
+```{r}
+pdf_text("input/pdf/top10adm-30_10.pdf") %>%
+  str_split("\n") %>%
+  print()
+```
+
+```{r pdftools}
+
+# prepare empty table for totals per filename
+totals_for_quality_check <- tibble()
+
+extracted_data <- pdf_files_to_read %>%
+  map_df(function(current_filename) {
+    current_path <- glue("input/pdf/{current_filename}")
+    current_filecontent <- pdf_text(current_path)
+
+    # save the information about start and end date of observation
+    time_info <- current_filecontent %>%
+      str_match("(\\d{2}\\.\\d{2}\\.\\d{4}).*?(\\d{2}\\.\\d{2}\\.\\d{4})")
+
+    # if time info is empty, return early, this file is corrupt
+    if (is.na(time_info[1, 1])) {
+      return(tibble(
+        filename = current_filename,
+        error = "file corrupt"
+      ))
+    }
+
+    # extract start and end of observation period (Thu - Sun)
+    from <- as.Date(time_info[1, 2], format = "%d.%m.%Y")
+    to <- as.Date(time_info[1, 3], format = "%d.%m.%Y")
+
+    # by creating a named character vector we can define the regular expression
+    # for the search in a more human readable format
+    movie_data_search <- c(
+      "region" = "^\\s*(Deutschschweiz|Suisse Romande|Svizzera Italiana)|",
+      "rank" = "^\\s*(\\d+)\\s+",
+      "title" = "(.*?)\\s+",
+      "distributor" = "([\\w]+!?)\\s+",
+      "screens" = "(\\d+)\\s+",
+      "admissions" = "([\\d']+)\\s+",
+      "total" = "([\\d']+)\\s*$"
+    )
+
+    current_lines <- current_filecontent %>%
+      str_split("\n") %>%
+      first() %>%
+      as_tibble()
+
+    # save away totals for later quality check
+    totals_for_quality_check <<- bind_rows(
+      totals_for_quality_check,
+      current_lines %>%
+        filter(str_detect(value, "^Total Top 10")) %>%
+        mutate(filename = current_filename)
+    )
+
+    # we match the lines against the search above
+    result <- tidyr::extract(
+      current_lines,
+      1, # from first column
+      into = names(movie_data_search),
+      # make the regex case insensitive
+      regex = paste0("(?i)", glue_collapse(movie_data_search)),
+      ignore_case = TRUE
+    )
+
+    # return
+    result %>%
+      fill(region) %>%
+      # convert numbers to numeric
+      mutate_at(
+        vars(rank, screens:total),
+        ~ as.numeric(str_replace_all(., "[^\\d]", ""))
+      ) %>%
+      # filter out unnecessary lines
+      filter(!is.na(screens) & !is.na(rank)) %>%
+      # add info about week
+      mutate(
+        from = from,
+        to = to,
+        filename = current_filename
+      )
+  })
+
+```
+
+
+##### Quality check
+
+We saved away all the lines that contain the total admissions per language region. Now we can compare these totals with the sum of the numbers that we extracted above.
+
+```{r}
+
+knitr::kable(
+  totals_for_quality_check %>%
+    tidyr::extract(
+      value,
+      into = c("region", "total_is"),
+      regex = regex(
+        "(?i)(Deutschschweiz|Suisse Romande|Svizzera Italiana).*?([\\d']+)\\s*$",
+        ignore_case = TRUE
+      )
+    ) %>%
+    # convert to numeric
+    mutate(
+      total_is = as.numeric(str_replace_all(total_is, "[^\\d]", ""))
+    ) %>%
+    left_join(
+      extracted_data %>%
+        group_by(filename, region) %>%
+        summarise(total_should = sum(admissions, na.rm = TRUE)),
+      by = c("region", "filename")
+    ) %>%
+    # show entries where calculated and extracted total do not match
+    filter(total_is != total_should)
+)
+
+```
+
+The table above should be empty.
+
+
+#### Unreadable files
+
+But, we see that the following files could not be read:
+
+```{r}
+
+weird_files <- extracted_data %>%
+  filter(!is.na(error)) %>%
+  pull(filename)
+
+knitr::kable(
+  weird_files
+)
+
+# throw away these entries and columns as we won't need them anymore
+extracted_data %<>%
+  filter(is.na(error)) %>%
+  select(-error)
+
+```
+
+We read them in via tesseract. This is an OCR engine that converts the file to png first and then reads all the characters in it.
+
+
+### Tesseract
+
+```{r}
+
+# set up empty list of lines to debug
+debug_lines <- tibble()
+
+# the regions cannot be read in because they're on a dark background
+# we'll add them differently (see chunks below)
+movie_data_search <- c(
+  "rank" = "^\\s*(\\d+)\\s+",
+  "title" = "(.*?)\\s+",
+  "distributor" = "([\\w]+!?)\\s+",
+  "screens" = "(\\d+)\\s+",
+  "admissions" = "([\\d']+)\\s+",
+  "total" = "([\\d'\\.]+)\\s*$"
+)
+
+# what follows here is pretty much the same procedure as in pdftools above
+# but with some slight differences, so we won't abstract it into a function
+extracted_weird_data <- weird_files %>%
+  map_df(function(current_filename) {
+    current_path <- glue("input/pdf/{current_filename}")
+
+    # if has already been converted to png, take that, otherwise use pdf
+    current_path <- ifelse(
+      file.exists(str_replace(current_filename, "\\.pdf$", "_1.png")),
+      str_replace(current_filename, "\\.pdf$", "_1.png"),
+      current_path
+    )
+
+    # set up ocr by tesseract: language English
+    eng <- tesseract("eng")
+    current_filecontent <- ocr(current_path, engine = eng)
+
+    # save the information about start and end date of observation
+    time_info <- current_filecontent %>%
+      str_match("(\\d{2}\\.\\d{2}\\.\\d{4}).*?(\\d{2}\\.\\d{2}\\.\\d{4})")
+
+    # if time info is empty, return early, this file is corrupt
+    if (current_filename == "top10adm-44_06.pdf") {
+      # this is the file without a header, so let's just set the dates manually
+      from <- as.Date("2006-11-02")
+      to <- as.Date("2006-11-05")
+    } else if (is.na(time_info[1, 1])) {
+      return(tibble(
+        filename = current_filename,
+        error = "file corrupt"
+      ))
+    } else {
+      # extract start and end of observation period (Thu - Sun)
+      from <- as.Date(time_info[1, 2], format = "%d.%m.%Y")
+      to <- as.Date(time_info[1, 3], format = "%d.%m.%Y")
+    }
+
+    current_lines <- current_filecontent %>%
+      str_split("\n") %>%
+      first() %>%
+      as_tibble()
+
+    # we match the lines against the search above
+    result <- tidyr::extract(
+      current_lines,
+      1, # from first column
+      into = names(movie_data_search),
+      regex = paste0("(?i)", glue_collapse(movie_data_search))
+    )
+
+    # append those that could not be matched to debug variable
+    # but add information about filename and from and to as well
+    debug_lines <<- bind_rows(
+      debug_lines,
+      current_lines[is.na(result$rank), ] %>%
+      # add info about week
+      mutate(
+        from = from,
+        to = to,
+        filename = current_filename
+      )
+    )
+
+    # return
+    result %<>%
+      # filter out empty rows
+      filter(!is.na(title)) %>%
+      # convert numbers to numeric
+      mutate_at(
+        vars(rank, screens:total),
+        ~ as.numeric(str_replace_all(., "[^\\d]", ""))
+      ) %>%
+      # add region, order is always Deutschschweiz, Romandie, Svizzera Italiana
+      mutate(region = case_when(
+        rank == 1 & row_number() < 5 ~ "Deutschschweiz",
+        rank == 1 & row_number() < 15 ~ "Suisse Romande",
+        rank == 1 & row_number() < 25 ~ "Svizzera Italiana"
+      )) %>%
+      fill(region) %>%
+      # add info about week
+      mutate(
+        from = from,
+        to = to,
+        filename = current_filename
+      )
+
+    # trigger warning if had unsuccessfull lines
+    if (nrow(result) != 30) {
+      warning(glue(
+        "length mismatch in {file}, did not extract 30 movies but {n}\n",
+        file = current_filename,
+        n = nrow(result)
+      ))
+    }
+    # return
+    result
+  })
+
+```
+
+
+#### Obvious Misreads
+
+Unfortunately we get quite some lines with movie data that could not be read:
+
+```{r inspect lines that could not be read}
+
+repair_these_manually <- debug_lines %>%
+  # filter out lines that start with Total / Top 10
+  filter(!str_detect(value, "^(Total )?(Top 10)")) %>%
+  # filter out lines about database and week info and reel
+  filter(!str_detect(value, "^(database|Week |reel © )")) %>%
+  # filter out empty lines
+  filter(nzchar(str_trim(value)))
+
+knitr::kable(
+  repair_these_manually
+)
+
+write_csv(
+  repair_these_manually,
+  "output/repair_these_manually.csv"
+)
+
+# clean up
+rm(weird_files, repair_these_manually)
+
+```
+
+We export them to a file, correct the mistakes by hand and read them in again with the above system. The language region we had to add manually.
+
+```{r}
+
+manually_repaired <- read_csv("input/manually_repaired.csv") %>%
+  tidyr::extract(
+    value,
+    into = names(movie_data_search),
+    regex = paste0("(?i)", glue_collapse(movie_data_search))
+  ) %>%
+  # filter out empty rows
+  filter(!is.na(title)) %>%
+  # convert numbers to numeric
+  mutate_at(
+    vars(rank, screens:total),
+    ~ as.numeric(str_replace_all(., "[^\\d]", ""))
+  )
+
+# append to extracted data frame, but only once!
+if (extracted_weird_data %>%
+  filter(filename == "top10adm-02_11.pdf") %>%
+  nrow() == 29) {
+  extracted_weird_data %<>% bind_rows(
+    manually_repaired
+  )
+}
+
+# check if data is complete now
+knitr::kable(
+  extracted_weird_data %>%
+    group_by(filename) %>%
+    tally() %>%
+    filter(n != 30)
+)
+
+# clean up
+rm(movie_data_search)
+
+```
+
+The table above should be empty.
+
+
+#### Quality check
+
+I manually checked the differences in our extracted data and the pdf files and created the file `manually_corrected.csv`. It contains the correct numbers. We'll add them and then do the quality check.
+
+```{r}
+
+extracted_weird_data %<>%
+  left_join(
+    read_csv("input/manually_corrected.csv"),
+    by = c("rank", "region", "filename")
+  ) %>%
+  # if present, replace with corrected admission
+  mutate(
+    admissions = if_else(
+      is.na(real_admissions),
+      admissions,
+      real_admissions
+    )
+  ) %>%
+  select(-real_admissions)
+
+# perform again a quality check by using the lines in the debug data frame
+debug_lines %>%
+  filter(str_detect(value, "^(Total Top 10)")) %>%
+  tidyr::extract(
+    value,
+    into = c("region", "total_is"),
+    regex = regex(
+      "(?i)(Deutschschweiz|Suisse Romande|Svizzera Italiana).*?([\\d']+)\\s*$",
+      ignore_case = TRUE
+    )
+  ) %>%
+  # convert to numeric
+  mutate(
+    total_is = as.numeric(str_replace_all(total_is, "[^\\d]", ""))
+  ) %>%
+  left_join(
+    extracted_weird_data %>%
+      group_by(filename, region) %>%
+      summarise(total_should = sum(admissions, na.rm = TRUE)),
+    by = c("region", "filename"),
+    ignore
+  ) %>%
+  # show entries where calculated and extracted total do not match
+  filter(total_is != total_should)
+
+```
+
+The above table should be empty.
+
+This means we have finally read in all available data and can be pretty sure that all numbers are correct as the sum of each entry and the total in the files match up.
+
+
+## Linting
+
+This code was linted by [lintr](https://github.com/jimhester/lintr) after he [tidyverse style guide](http://style.tidyverse.org/).
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+lintr::lint("main.Rmd", linters = lintr::with_defaults())
+```

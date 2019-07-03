@@ -1,0 +1,14 @@
+.httr-oauth
+.google_API_keys
+*.Rproj
+*.Rproj.user
+*.Rhistory
+*.Rprofile
+*.html
+**/~$*.xls*
+auth
+.~lock*
+manifest.R
+output/ignore/*
+input/ignore/*
+top10adm*.png
