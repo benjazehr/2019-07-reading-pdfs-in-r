@@ -673,7 +673,7 @@ debug_lines %>%
 
 ```
 
-The above table should be empty.
+The above table should be empty. It is not, but the error is not in our data but in the column `total_is`. The number 3977 was read incorrectly. The total is in fact 3577, the 9 was read as a 5.
 
 This means we have finally read in all available data and can be pretty sure that all numbers are correct as the sum of each entry and the total in the files match up.
 
